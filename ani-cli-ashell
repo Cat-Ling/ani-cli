@@ -1,0 +1,336 @@
+#!/bin/sh
+# a-shell compatible version of ani-cli
+
+# --- Global Variables ---
+agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+allanime_refr="https://allmanga.to"
+allanime_base="allanime.day"
+allanime_api="https://api.${allanime_base}"
+mode="${ANI_CLI_MODE:-sub}"
+hist_dir="$HOME/Documents/ani-cli"
+histfile="$hist_dir/history.log"
+
+# --- Utility Functions ---
+die() {
+    printf "Error: %s\n" "$1" >&2
+    exit 1
+}
+
+check_deps() {
+    for dep in "$@"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            if [ "$dep" = "ffmpeg" ]; then
+                die "\"$dep\" is not found. In a-shell, please run: pkg install ffmpeg"
+            else
+                die "\"$dep\" is not found. Please install it."
+            fi
+        fi
+    done
+}
+
+# --- Scraping Functions ---
+search_anime() {
+    search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name availableEpisodes __typename } }}'
+    curl -s -G "${allanime_api}/api" \
+        --data-urlencode "variables={\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"}" \
+        --data-urlencode "query=$search_gql" \
+        -A "$agent" \
+        -e "$allanime_refr" || die "Failed to fetch search results." |
+        sed 's/,"__typename":"Show"//g' |
+        sed 's/{"_id":"/\n/g' |
+        sed -n "s/^\([^\"]*\)\",\"name\":\"\([^\"]*\)\",\"availableEpisodes\":{\"${mode}\":\([0-9]*\)}}.*/\1\t\2 (\3 episodes)/p" |
+        sed 's/\\\"/"/g'
+}
+
+episodes_list() {
+    episodes_list_gql='query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}'
+    curl -s -G "${allanime_api}/api" \
+        --data-urlencode "variables={\"showId\":\"$1\"}" \
+        --data-urlencode "query=$episodes_list_gql" \
+        -A "$agent" \
+        -e "$allanime_refr" || die "Failed to fetch episode list." |
+        sed "s/.*\"${mode}\":\[\(.*\)\]}.*/\1/" |
+        sed 's/,/\n/g; s/"//g' |
+        sort -n
+}
+
+get_links() {
+    response="$(curl -s "https://allanime.day$1" -A "$agent" -e "$allanime_refr" || die "Failed to get links from provider.")"
+    episode_link="$(printf '%s' "$response" | sed 's|},{|\n|g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p')"
+    case "$episode_link" in
+        *repackager.wixmp.com*)
+            extract_link=$(printf "%s" "$episode_link" | cut -d'>' -f2 | sed 's|repackager.wixmp.com/||g;s|\.urlset.*||g')
+            for j in $(printf "%s" "$episode_link" | sed -nE 's|.*/,([^/]*),/mp4.*|\1|p' | sed 's|,|\n|g'); do
+                printf "%s >%s\n" "$j" "$extract_link" | sed "s|,[^/]*|${j}|g"
+            done | sort -nr
+            ;;
+        *master.m3u8*)
+            m3u8_refr=$(printf '%s' "$response" | sed -nE 's|.*Referer":"([^"]*)".*|\1|p') && printf '%s\n' "m3u8_refr >$m3u8_refr" >> "$cache_dir/m3u8_refr"
+            extract_link=$(printf "%s" "$episode_link" | head -1 | cut -d'>' -f2)
+            relative_link=$(printf "%s" "$extract_link" | sed 's|[^/]*$||')
+            m3u8_streams="$(curl -e "$m3u8_refr" -s "$extract_link" -A "$agent")"
+            printf "%s" "$m3u8_streams" | grep -q "EXTM3U" && printf "%s" "$m3u8_streams" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' |
+                sed "s|>|cc>${relative_link}|g" | sort -nr
+            printf '%s' "$response" | sed -nE 's|.*"subtitles":\[\{"lang":"en","label":"English","default":"default","src":"([^"]*)".*|subtitle >\1|p' >> "$cache_dir/suburl"
+            ;;
+        *) [ -n "$episode_link" ] && printf "%s\n" "$episode_link" ;;
+    esac
+}
+
+provider_init() {
+    provider_name=$1
+    hex_string=$(printf "%s" "$resp" | sed -n "$2" | head -1 | cut -d':' -f2)
+    # Use awk to decode the hex string. This is more robust than a giant case statement.
+    decoded_string=$(echo "$hex_string" | awk '{ for(i=1; i<=length; i+=2) printf "%c", strtonum("0x" substr($0,i,2)) }')
+    provider_id=$(printf "%s" "$decoded_string" | sed "s/\/clock/\/clock.json/")
+}
+
+generate_link() {
+    case $1 in
+        1) provider_init "wixmp" "/Default :/p" ;;
+        2) provider_init "youtube" "/Yt-mp4 :/p" ;;
+        3) provider_init "sharepoint" "/S-mp4 :/p" ;;
+        *) provider_init "hianime" "/Luf-Mp4 :/p" ;;
+    esac
+    [ -n "$provider_id" ] && get_links "$provider_id"
+}
+
+select_quality() {
+    links=$1
+    quality_pref=$2
+    case "$quality_pref" in
+        best) result=$(echo "$links" | head -n1) ;;
+        worst) result=$(echo "$links" | grep -E '^[0-9]{3,4}' | tail -n1) ;;
+        *) result=$(echo "$links" | grep -m 1 "$quality_pref") ;;
+    esac
+    if [ -z "$result" ]; then
+        echo "Quality '$quality_pref' not found, defaulting to best." >&2
+        result=$(echo "$links" | head -n1)
+    fi
+    episode=$(echo "$result" | cut -d'>' -f2)
+    m3u8_refr=$(echo "$links" | grep 'm3u8_refr >' | cut -d'>' -f2)
+}
+
+get_episode_url() {
+    id=$1
+    ep_no=$2
+    quality=$3
+    episode_embed_gql='query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
+    resp=$(curl -s -G "${allanime_api}/api" \
+        --data-urlencode "variables={\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"}" \
+        --data-urlencode "query=$episode_embed_gql" \
+        -A "$agent" -e "$allanime_refr" || die "Failed to get episode details.")
+
+    export cache_dir
+    cache_dir="$(mktemp -d)"
+
+    providers="1 2 3 4"
+    all_links=""
+    for provider in $providers; do
+        provider_links=$(generate_link "$provider")
+        if [ -n "$provider_links" ]; then
+            all_links="${all_links}${provider_links}\n"
+        fi
+    done
+
+    # Also collect m3u8_refr and suburl if they were created
+    [ -f "$cache_dir/m3u8_refr" ] && all_links="${all_links}$(cat "$cache_dir/m3u8_refr")\n"
+    [ -f "$cache_dir/suburl" ] && all_links="${all_links}$(cat "$cache_dir/suburl")\n"
+
+    links=$(printf "%b" "$all_links" | sort -g -r -s)
+    rm -r "$cache_dir"
+    unset cache_dir
+
+    select_quality "$links" "$quality"
+    if [ -z "$episode" ]; then
+        die "Could not get episode URL. No valid sources found."
+    fi
+}
+
+# --- History Functions ---
+setup_history() {
+    mkdir -p "$hist_dir"
+    touch "$histfile"
+}
+
+update_history() {
+    ep_no=$1
+    id=$2
+    title=$3
+    tmp_histfile="$hist_dir/history.tmp"
+    if grep -q -- "$id" "$histfile"; then
+        sed "s|^[^	]*	${id}	.*$|${ep_no}	${id}	${title}|" "$histfile" > "$tmp_histfile" && mv "$tmp_histfile" "$histfile"
+    else
+        echo "${ep_no}	${id}	${title}" >> "$histfile"
+    fi
+}
+
+process_hist_entry() {
+    id=$1
+    ep_no=$2
+    title=$3
+    ep_list=$(episodes_list "$id")
+    latest_ep=$(echo "$ep_list" | tail -n1)
+    title=$(echo "$title" | sed "s/[0-9]\+ episodes/${latest_ep} episodes/")
+    next_ep=$(echo "$ep_list" | sed -n "/^${ep_no}$/{n;p;}")
+    if [ -n "$next_ep" ]; then
+        echo "$id	$title - episode $next_ep"
+    fi
+}
+
+# --- UI Functions ---
+select_from_list() {
+    prompt_msg=$1
+    list=$(cat -)
+    item_count=$(echo "$list" | wc -l | tr -d ' ')
+    if [ "$item_count" -eq 0 ]; then
+        echo "No items to select from." >&2
+        return 1
+    fi
+    echo "$list" | nl -w 2 -s '. '
+    while true; do
+        printf "%s (1-%d): " "$prompt_msg" "$item_count"
+        read -r selection
+        if [ "$selection" -ge 1 ] && [ "$selection" -le "$item_count" ] 2>/dev/null; then
+            echo "$list" | sed -n "${selection}p"
+            return 0
+        else
+            echo "Invalid selection. Please try again." >&2
+        fi
+    done
+}
+
+# --- Download Functions ---
+download_episode() {
+    episode_url=$1
+    filename=$2
+    m3u8_refr=$3
+    allanime_refr=$4
+    download_dir="$HOME/Documents/downloads"
+    mkdir -p "$download_dir"
+    echo "Downloading '$filename.mp4' to $download_dir..."
+    case "$episode_url" in
+        *m3u8*)
+            check_deps ffmpeg
+            echo "Detected m3u8 stream, using ffmpeg..."
+            ffmpeg -loglevel error -stats -i "$episode_url" -c copy -bsf:a aac_adtstoasc -referer "$m3u8_refr" "$download_dir/$filename.mp4"
+            ;;
+        *)
+            echo "Detected direct link, using curl..."
+            curl -L -e "$allanime_refr" -o "$download_dir/$filename.mp4" "$episode_url"
+            ;;
+    esac
+    if [ $? -eq 0 ]; then
+        echo "Download complete!"
+    else
+        die "Download failed."
+    fi
+}
+
+# --- Playback Functions ---
+play_episode() {
+    allanime_title=$1
+    ep_no=$2
+    episode_url=$3
+    id=$4
+    echo "Playing episode $ep_no of $allanime_title..."
+    open "vlc://${episode_url}"
+    echo "Playback command sent to VLC. If it didn't open, please check if VLC is installed."
+    update_history "$ep_no" "$id" "$allanime_title"
+}
+
+play() {
+    start=$(echo "$ep_no" | cut -d- -f1)
+    end=$(echo "$ep_no" | cut -d- -f2)
+    if [ -z "$end" ] || [ "$end" = "$start" ]; then
+        get_episode_url "$id" "$start" "$quality"
+        play_episode "$title" "$start" "$episode" "$id"
+    else
+        range=$(echo "$ep_list" | sed -n "/^${start}$/,/^${end}$/p")
+        if [ -z "$range" ]; then
+            die "Invalid episode range!"
+        fi
+        for i in $range; do
+            ep_no=$i
+            echo "Fetching episode $ep_no..."
+            get_episode_url "$id" "$ep_no" "$quality"
+            play_episode "$title" "$ep_no" "$episode" "$id"
+            sleep 2
+        done
+    fi
+}
+
+# --- Main Logic ---
+main() {
+    check_deps curl sed grep sort nl wc tr cut head tail mktemp awk
+
+    quality="best"
+    action="play"
+    query=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -q | --quality)
+                [ $# -lt 2 ] && die "Missing argument for $1"
+                quality="$2"
+                shift
+                ;;
+            --dub)
+                mode="dub"
+                ;;
+            -d | --download)
+                action="download"
+                ;;
+            -c | --continue)
+                action="continue"
+                ;;
+            *)
+                query="$query $1"
+                ;;
+        esac
+        shift
+    done
+    query=$(echo "$query" | sed 's/^ *//')
+    setup_history
+    if [ "$action" = "continue" ]; then
+        anime_list=$(while IFS= read -r line; do
+            id=$(echo "$line" | cut -f2)
+            ep_no=$(echo "$line" | cut -f1)
+            title=$(echo "$line" | cut -f3)
+            process_hist_entry "$id" "$ep_no" "$title"
+        done < "$histfile")
+        [ -z "$anime_list" ] && die "No history found or no new episodes available."
+        selected_anime=$(echo "$anime_list" | select_from_list "Select anime to continue:")
+    else
+        if [ -z "$query" ]; then
+            printf "Search anime: "
+            read -r query
+        fi
+        [ -z "$query" ] && die "Search query cannot be empty."
+        echo "Searching for '$query'..."
+        search_results=$(search_anime "$query")
+        [ -z "$search_results" ] && die "No results found."
+        selected_anime=$(echo "$search_results" | select_from_list "Select anime:")
+    fi
+    [ -z "$selected_anime" ] && exit 1
+    id=$(echo "$selected_anime" | cut -f1)
+    title=$(echo "$selected_anime" | cut -f2)
+    if [ "$action" = "continue" ]; then
+        ep_no=$(echo "$selected_anime" | sed -n 's/.*- episode //p')
+    else
+        echo "Fetching episode list for '$title'..."
+        ep_list=$(episodes_list "$id")
+        [ -z "$ep_list" ] && die "No episodes found for this anime."
+        ep_no=$(echo "$ep_list" | select_from_list "Select episode:")
+    fi
+    [ -z "$ep_no" ] && exit 1
+    if [ "$action" = "download" ]; then
+        echo "Preparing to download episode $ep_no..."
+        get_episode_url "$id" "$ep_no" "$quality"
+        filename=$(echo "$title" | sed 's/ (.*//; s/[^a-zA-Z0-9._-]/_/g')
+        download_episode "$episode" "${filename}_ep_${ep_no}" "$m3u8_refr" "$allanime_refr"
+    else
+        play
+    fi
+}
+
+main "$@"
